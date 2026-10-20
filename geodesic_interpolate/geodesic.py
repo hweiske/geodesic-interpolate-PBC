@@ -9,7 +9,8 @@ from scipy import sparse
 from scipy.optimize import least_squares
 
 from .coord_utils import (
-    align_path, compute_wij, compute_wij_sparse, get_bond_list, morse_scaler)
+    align_path, compute_wij, compute_wij_sparse, fixed_mask, get_bond_list, get_radii, morse_scaler)
+from .pbc import normalize_cell
 
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class Geodesic(object):
     """Optimizer to obtain geodesic in redundant internal coordinates.  Core part is the calculation
     of the path length in the internal metric."""
     def __init__(self, atoms, path, scaler=1.7, threshold=3.0, min_neighbors=4, log_level=logging.INFO,
-                 friction=1e-3):
+                 friction=1e-3, cell=None, pbc=None, fixed=None, enforce=()):
         """Initialize the interpolater
         Args:
             atoms:      Atom symbols, used to lookup radii
@@ -34,16 +35,32 @@ class Geodesic(object):
             log_level:  Logging level to use.
             friction:   Friction term in the target function which regularizes the optimization step
                         size to prevent explosion.
+            cell:       Lattice vectors as rows (ASE convention) for periodic systems.  The path is
+                        unwrapped with the minimum image convention, so atoms may be wrapped
+                        differently in each image.  None for molecules.
+            pbc:        Periodic directions, one or three bools.  Defaults to fully periodic when
+                        a cell is given.
+            fixed:      Fixed atoms (indices or boolean mask) or a boolean (natoms, 3) mask of fixed
+                        Cartesian components.  Fixed coordinates are never changed, and rigid-body
+                        alignment of the path is disabled.
+            enforce:    Atom pairs to include in the coordinate system in any case.
         """
-        rmsd0, self.path = align_path(path)
-        logger.log(log_level, "Maximum RMSD change in initial path: %10.2f", rmsd0)
-        if self.path.ndim != 3:
+        self.cell, self.pbc = normalize_cell(cell, pbc)
+        path = np.asarray(path, dtype=float)
+        if path.ndim != 3:
             raise ValueError('The path to be interpolated must have 3 dimensions')
+        self.fixed = fixed_mask(fixed, path.shape[1])
+        self.radii = get_radii(atoms)
+        rmsd0, self.path = align_path(path, self.cell, self.pbc, rigid=self.fixed is None, radii=self.radii)
+        logger.log(log_level, "Maximum RMSD change in initial path: %10.2f", rmsd0)
         self.nimages, self.natoms, _ = self.path.shape
+        # Mask of the Cartesian coordinates of one image that are optimized
+        self.free = np.ones(self.natoms * 3, dtype=bool) if self.fixed is None else ~self.fixed.ravel()
         # Construct coordinates
-        self.rij_list, self.re = get_bond_list(path, atoms, threshold=threshold, min_neighbors=min_neighbors)
-        if isinstance(scaler, float):
-            self.scaler = morse_scaler(re=self.re, alpha=1.7)
+        self.rij_list, self.re = get_bond_list(self.path, atoms, threshold=threshold, min_neighbors=min_neighbors,
+                                               enforce=enforce, cell=self.cell, pbc=self.pbc)
+        if isinstance(scaler, (int, float)):
+            self.scaler = morse_scaler(re=self.re, alpha=scaler)
         else:
             self.scaler = scaler
         self.nrij = len(self.rij_list)
@@ -78,15 +95,28 @@ class Geodesic(object):
         gradients of internal coordinates."""
         for i, (X, w, dwdR) in enumerate(zip(self.path, self.w, self.dwdR)):
             if w is None:
-                self.w[i], self.dwdR[i] = compute_wij_sparse(X, self.rij_list, self.scaler)
+                self.w[i], self.dwdR[i] = compute_wij_sparse(X, self.rij_list, self.scaler, self.cell)
         for i, (X0, X1, w) in enumerate(zip(self.path, self.path[1:], self.w_mid)):
             if w is None:
                 self.X_mid[i] = Xm = (X0 + X1) / 2
-                self.w_mid[i], self.dwdR_mid[i] = compute_wij_sparse(Xm, self.rij_list, self.scaler)
+                self.w_mid[i], self.dwdR_mid[i] = compute_wij_sparse(Xm, self.rij_list, self.scaler, self.cell)
+
+    def _free_coords(self, start, end):
+        """Mask selecting the optimized coordinates of a flattened path segment."""
+        return np.tile(self.free, end - start)
+
+    def segment_coords(self, start, end):
+        """Optimized (non-fixed) coordinates of a segment of the path, flattened."""
+        return self.path[start:end].ravel()[self._free_coords(start, end)]
 
     def update_geometry(self, X, start, end):
         """Update the geometry of a segment of the path, then set the corresponding internal
-        coordinate, derivatives and midpoint locations to unknown"""
+        coordinate, derivatives and midpoint locations to unknown.  `X` only holds the
+        optimized coordinates if some atoms are fixed."""
+        if self.fixed is not None:
+            full = self.path[start:end].ravel().copy()
+            full[self._free_coords(start, end)] = X
+            X = full
         X = X.reshape(self.path[start:end].shape)
         if np.array_equal(X, self.path[start:end]):
             return False
@@ -109,6 +139,8 @@ class Geodesic(object):
             trans = np.zeros(self.path[start:end].size)
         else:
             trans = friction * dx  # Translation from initial geometry.  friction term 
+        if self.fixed is not None:
+            trans = trans[self._free_coords(start, end)]
         self.disps = np.concatenate(vecs_l + vecs_r + [trans])
         self.disps0 = self.disps[:len(vecs_l) * 2]
 
@@ -133,6 +165,11 @@ class Geodesic(object):
             blocks[l + i][i] = self.dwdR[image] - dmid1
             blocks[l * 2 + i][i] = friction_block
         self.grad = sparse.bmat(blocks, format='csr')
+        if self.fixed is not None:
+            # Drop the columns, and friction rows, of fixed coordinates
+            cols = np.flatnonzero(self._free_coords(start, end))
+            rows = np.concatenate([np.arange(l * 2 * self.nrij), l * 2 * self.nrij + cols])
+            self.grad = self.grad[rows][:, cols]
         self.grad0 = self.grad[:l * 2 * self.nrij]
 
     def compute_target_func(self, X=None, start=1, end=-1, log_level=logging.INFO, x0=None, friction=1e-3):
@@ -191,9 +228,9 @@ class Geodesic(object):
             The optimized path.  This is also stored in self.path
         """
         start, end = self._resolve_segment(start, end)
-        X0 = np.array(self.path[start:end]).ravel()
+        X0 = self.segment_coords(start, end)
         if xref is None:
-            xref= X0
+            xref = self.path[start:end].ravel().copy()
         self.disps = self.grad = self.segment = None
         logger.log(log_level, "  Degree of freedoms %6d: ", len(X0))
         if friction is None:
@@ -201,14 +238,14 @@ class Geodesic(object):
         # Configure the keyword arguments that will be sent to the target function.
         kwargs = dict(start=start, end=end, log_level=log_level, x0=xref, friction=friction)
         self.compute_target_func(**kwargs)  # Compute length and optimality
-        if self.optimality > tol:
+        if self.optimality > tol and X0.size:
             result = least_squares(self.target_func, X0, self.target_deriv_sparse, ftol=tol, gtol=tol,
                                    max_nfev=max_iter, kwargs=kwargs, loss='soft_l1')
             self.update_geometry(result['x'], start, end)
             logger.log(log_level, "Smoothing converged after %d iterations", result['nfev'])
         else:
             logger.log(log_level, "Skipping smoothing: path already optimal.")
-        rmsd, self.path = align_path(self.path)
+        rmsd, self.path = align_path(self.path, self.cell, self.pbc, rigid=self.fixed is None, radii=self.radii)
         logger.log(log_level, "Final path length: %12.5f  Max RMSD in path: %10.2f", self.length, rmsd)
         return self.path
 
@@ -231,7 +268,7 @@ class Geodesic(object):
         start, end = self._resolve_segment(start, end)
         self.neval = 0
         images = range(start, end)
-        logger.info("  Degree of freedoms %6d: ", (end - start) * 3 * self.natoms)
+        logger.info("  Degree of freedoms %6d: ", (end - start) * np.sum(self.free))
         # Microiteration convergence tolerances are adjusted on the fly based on level of convergence.
         curr_tol = tol * 10
         self.compute_disps()    # Compute and print the initial path length
@@ -256,6 +293,6 @@ class Geodesic(object):
             images = list(reversed(images))         # Alternate sweeping direction.
         else:
             logger.info("Optimization not converged after %d iteartions", iteration)
-        rmsd, self.path = align_path(self.path)
+        rmsd, self.path = align_path(self.path, self.cell, self.pbc, rigid=self.fixed is None, radii=self.radii)
         logger.info("Final path length: %12.5f  Max RMSD in path: %10.2f", self.length, rmsd)
         return self.path

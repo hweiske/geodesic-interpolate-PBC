@@ -24,6 +24,7 @@ setup(
     install_requires=[
         'numpy>=1.13',
         'scipy>=0.19',
+        'ase>=3.22',
     ],
     entry_points = {
         'console_scripts': [

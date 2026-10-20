@@ -22,7 +22,10 @@ Directory Structure
   - `coord_utils.py`   Coordinate utilities.  A simplified version of Nanoreactor coordinates module which provide a scaled
    interatomic distance coordinate, pair screening based on threshold and connectivity, as well as trans-rotational
    alignment based on Kabsch algorithm.
-  - `fileio.py`        XYZ file reading and writing
+  - `fileio.py`        XYZ file reading and writing, and reading/writing periodic structures through ASE
+  - `pbc.py`           Periodic boundary condition utilities: cell handling, minimum image convention, path unwrapping
+   and periodic neighbor search
+  - `ase_interface.py` Interpolation of lists of `ase.Atoms`
 - setup.py             Installation script.  This will install both the Python package, which can be imported by name `geodesic_interpolate`
    and the standalone script, which is also named `geodesic_interpolate`
 - test_cases           A few test cases used to check the performance of the code.  Note that the large ones may take a few minutes
@@ -56,6 +59,8 @@ Numpy  :  Tested with 1.13
 
 Scipy  :  Tested with 0.19
 
+ASE    :  >=3.22 (file I/O, periodic systems, constraints, covalent radii)
+
 
 Installation
 ----
@@ -80,7 +85,71 @@ This will install a Python package `geodesic_interpolate` and a standalone scrip
 The package can be invoked from an arbitrary location using the aforementioned command line after installation,
 and a standalone script with the same signature can also be used
 
-    geodesic_interpolate filename.xyz --output output.xyz --nimages 20 ...
+    geodesic_interpolate filename.xyz --output output.traj --nimages 20 ...
+
+
+Periodic systems and ASE
+----
+Periodic boundary conditions are supported for bulk, slab (2D) and wire (1D) systems.  Lists of
+[ASE](https://wiki.fysik.dtu.dk/ase/) `Atoms` can be interpolated directly; the cell, `pbc` flags and
+constraints are taken from the images:
+
+    from ase.io import read
+    from ase.mep import NEB
+    from geodesic_interpolate import interpolate
+
+    images = interpolate([read('initial.traj'), read('final.traj')], nimages=9)
+    neb = NEB(images)
+
+The command line script reads any format ASE understands (XYZ, extended XYZ, POSCAR/CONTCAR, CIF, traj,
+...), also from several files, and writes an ASE trajectory by default.  `--vasp` additionally writes the
+image folders of a VASP NEB calculation (`00/POSCAR` ... `NN/POSCAR`, with selective dynamics):
+
+    geodesic_interpolate POSCAR_initial POSCAR_final --nimages 9 --vasp neb
+
+The lower level API takes `cell` (lattice vectors as rows), `pbc` and `fixed` arguments, e.g.
+`Geodesic(symbols, path, cell=cell, pbc=[True, True, False], fixed=[0, 1, 2])` and
+`redistribute(..., cell=cell, pbc=pbc, fixed=fixed)`.
+
+How it works:
+  - Atoms may be wrapped differently in each image.  The path is first unwrapped: bonds present in both
+    images (1.2 times the sum of covalent radii) keep their periodic image, and every bonded fragment is
+    translated as a whole by the lattice vector that minimizes its displacement.  Atoms without such bonds
+    follow the minimum image convention (MIC).  Fragments may therefore move by more than half a lattice
+    vector (e.g. a chain end passing through the cell boundary), while isolated atoms must move less.
+  - Each internal coordinate is the distance between atom `i` and a fixed periodic image `j + n` of atom
+    `j`, stored as `(i, j, n1, n2, n3)`.  The lattice translations `n` are found by a periodic neighbor search
+    and kept fixed during the optimization, so coordinates stay smooth when atoms cross the cell boundary.
+    Small cells, where an atom interacts with several images of the same neighbor, are handled correctly.
+  - No rotational or translational alignment is performed, so atoms that do not move (e.g. fixed slab
+    layers) stay in place.  The cell must be the same for all images.
+
+Fixed atoms:
+  - `FixAtoms`, `FixCartesian` and `FixScaled` (selective dynamics of POSCAR files, when the fixed directions
+    are Cartesian axes) constraints are enforced for coordinates fixed in *all* input images, as are atoms given
+    with `--fix 0-17 20` or `fixed=`.  Fixed coordinates are removed from the optimization and never change.
+    With fixed atoms, rigid-body alignment of molecules is disabled as well.
+  - Coordinates fixed in only some input images, e.g. atoms pinned to relax a constrained end point, move freely
+    along the path.  The end points of the output keep their own constraints; interior images get the common ones.
+
+Covalent radii, used for the reference distances of the scaled coordinates, are taken from `ase.data`
+(Cordero et al., Dalton Trans. 2008, 2832), so all elements are covered.
+
+`examples/make_gifs.py` runs a few example interpolations (vacancy hop in Al, H on Cu(111) with fixed bottom
+layers, and two of the molecular test cases) and renders them as GIFs with
+[AtomsPlotter](https://doi.org/10.5281/zenodo.23316072).
+  - The output path is unwrapped so that atoms move continuously; use `wrap=True` (`--wrap`) to wrap atoms
+    back into the cell.  `use_pbc=False` (`--no-pbc`) ignores the cell.
+
+Smoothing and reproducibility:
+  - After smoothing, all images are checked for atom pairs closer than `--dist-cutoff` that are not part of the
+    coordinate system (e.g. a molecule pushed into a surface or through itself).  These are added and the path is
+    smoothed again, up to `--max-rounds` times (`max_rounds=`, default 5).
+  - The bisection uses random nudges.  `--seed` (`seed=`) makes runs reproducible; results also depend on the
+    number of BLAS threads (`OMP_NUM_THREADS`).
+  - `--scaling` now sets the Morse alpha; previously it was ignored and 1.7 was always used.
+  - Bonds are described by saturating Morse-scaled distances, so a strongly curved path can still stretch a bond
+    that exists in both end points.  Check bond lengths along large-amplitude paths.
 
 
 Usage
@@ -90,14 +159,16 @@ usage: geodesic_interpolate [-h] [--nimages NIMAGES] [--sweep] [--no-sweep]
                             [--microiter MICROITER] [--scaling SCALING]
                             [--friction FRICTION] [--dist-cutoff DIST_CUTOFF]
                             [--logging {DEBUG,INFO,WARNING,ERROR}]
-                            [--save-raw SAVE_RAW]
-                            filename
+                            [--save-raw SAVE_RAW] [--vasp [DIR]] [--max-rounds MAX_ROUNDS] [--seed SEED]
+                            [--fix INDEX [INDEX ...]] [--no-pbc] [--wrap]
+                            filename [filename ...]
 
 Interpolates between two geometries
 
 positional arguments:
-  * filename            XYZ file containing geometries. If the number of images is smaller than the desired number,
-   interpolation points will be added. If the number is greater, subsampling will be performed.
+  * filename            File(s) containing geometries in any format ASE can read. If the number of images is smaller than
+   the desired number, interpolation points will be added. If the number is greater, subsampling will be performed.
+   Cell and periodic boundary conditions of the first image are used; coordinates fixed in all images stay fixed.
 
 optional arguments:
   * `-h`, `--help`      show this help message and exit
@@ -105,7 +176,9 @@ optional arguments:
   * `--sweep`           Sweep across the path optimizing one image at a time, instead of moving all images at the same time.
    Default is to perform sweeping updates if there are more than 30 atoms. (default: None)
   * `--no-sweep`        Do not perform sweeping. (default: None)
-  * `--output OUTPUT`   Output filename. Default is interp.xyz (default: interpolated.xyz)
+  * `--output OUTPUT`   Output filename.  The format is determined by ASE from the extension. (default: interpolated.traj)
+  * `--vasp [DIR]`      Also write VASP NEB input, DIR/00/POSCAR ... DIR/NN/POSCAR.  DIR defaults to the current directory.
+  * `--fix INDEX ...`   Indices of atoms to keep fixed in addition to the constraints in the input, e.g. `--fix 0-15 20`.
   * `--tol TOL`         Convergence tolerance (default: 0.002)
   * `--maxiter MAXITER` Maximum number of minimization iterations (default: 15)
   * `--microiter MICROITER`  Maximum number of micro iterations for sweeping algorithm. (default: 20)
@@ -114,3 +187,9 @@ optional arguments:
   * `--dist-cutoff DIST_CUTOFF` Cut-off value for the distance between a pair of atoms to be included in the coordinate system. (default: 3)
   * `--logging {DEBUG,INFO,WARNING,ERROR}`   Logging level to adopt [ DEBUG | INFO | WARNING | ERROR ] (default: INFO)
   * `--save-raw SAVE_RAW`   When specified, save the raw path after bisections be before smoothing. (default: None)
+  * `--max-rounds MAX_ROUNDS`  Maximum number of smoothing rounds; atom pairs that came into contact without being
+   coordinates are added after each round. 1 smooths only once. (default: 5)
+  * `--seed SEED`       Random seed for reproducible results. Results also depend on the number of BLAS threads.
+  * `--no-pbc`          Ignore the cell of periodic input files and treat the system as a molecule.
+  * `--wrap`            Wrap atoms back into the cell in the output.  By default periodic paths are written unwrapped
+   so that atoms move continuously.
