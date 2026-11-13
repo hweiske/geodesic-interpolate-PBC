@@ -8,12 +8,14 @@ Xiaolei Zhu et al, Martinez Group, Stanford University
 """
 import logging
 import argparse
+import os
 
 import numpy as np
 from ase.io import read, write
 
 from .ase_interface import atoms_to_path, get_path_fixed_mask, path_to_atoms, write_vasp_neb
-from .interpolation import redistribute, smooth_path
+from .analysis import analyze_path, format_report, violations
+from .interpolation import interpolate_seeds, redistribute, smooth_path
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,15 @@ def main():
                     "OMP_NUM_THREADS.")
     ps.add_argument("--wrap", action="store_true", help="Wrap atoms back into the cell in the output.  By "
                     "default periodic paths are written unwrapped so that atoms move continuously.")
+    ps.add_argument("--seeds", nargs='+', type=int, default=None, metavar='SEED', help="Run several random seeds, "
+                    "check each path for torn bonds, close contacts and bonds passing through each other, print "
+                    "a report and keep the shortest path passing all checks.  Exits with status 2 if none passes.")
+    ps.add_argument("--jobs", type=int, default=1, help="Number of parallel processes for --seeds.  Results for a "
+                    "seed can depend on the number of BLAS threads, so set OMP_NUM_THREADS consistently.")
+    ps.add_argument("--keep-all", dest='keep_all', action="store_true", help="With --seeds, also write the path "
+                    "of every seed, as <output>_seed<SEED>.<ext>.")
+    ps.add_argument("--analyze", action="store_true", help="Check the final path (as for --seeds) and print the "
+                    "report.")
     args = ps.parse_args()
 
     # Setup logging based on designated logging level
@@ -100,8 +111,15 @@ def main():
     if fixed.any():
         logger.info('Keeping %d Cartesian coordinates of %d atoms fixed', fixed.sum(), fixed.any(axis=1).sum())
 
+    def to_atoms(path):
+        return path_to_atoms(images, path, fixed, args.wrap)
+
     def save(filename, path):
-        write(filename, path_to_atoms(images, path, fixed, args.wrap))
+        write(filename, to_atoms(path))
+
+    if args.seeds is not None:
+        run_seeds(args, symbols, X, cell, pbc, fixed, to_atoms)
+        return
 
     # First redistribute number of images.  Perform interpolation if too few and subsampling if too many
     # images are given
@@ -124,6 +142,39 @@ def main():
         save(args.output, current[-1].path if current else raw)
     if args.vasp is not None:
         write_vasp_neb(path_to_atoms(images, smoother.path, fixed, args.wrap), args.vasp)
+    if args.analyze:
+        quality = analyze_path(smoother.path, symbols, cell, pbc)
+        print(format_report([('final', quality)], symbols))
+        if violations(quality):
+            raise SystemExit(2)
+
+
+def run_seeds(args, symbols, X, cell, pbc, fixed, to_atoms):
+    """Interpolate with several seeds, report the checks and keep the best path."""
+    def save(filename, path):
+        write(filename, to_atoms(path))
+
+    runs = interpolate_seeds(symbols, X, args.nimages, args.seeds, jobs=args.jobs, scaling=args.scaling,
+                             threshold=args.dist_cutoff, friction=args.friction, sweep=args.sweep, tol=args.tol,
+                             max_iter=args.maxiter, micro_iter=args.microiter, max_rounds=args.max_rounds,
+                             cell=cell, pbc=pbc, fixed=fixed)
+    print(format_report([('seed %d' % run['seed'], run['quality']) for run in sorted(runs, key=lambda r: r['seed'])],
+                        symbols))
+    best = runs[0]
+    stem, ext = os.path.splitext(args.output)
+    if args.keep_all:
+        for run in runs:
+            save('%s_seed%d%s' % (stem, run['seed'], ext), run['path'])
+    save(args.output, best['path'])
+    if args.save_raw is not None:
+        save(args.save_raw, best['raw'])
+    if args.vasp is not None:
+        write_vasp_neb(to_atoms(best['path']), args.vasp)
+    if best['failed']:
+        print('No seed passed all checks; wrote seed %d (%s) to %s.' % (best['seed'], ', '.join(best['failed']),
+                                                                         args.output))
+        raise SystemExit(2)
+    print('Selected seed %d (shortest path passing all checks); wrote %s.' % (best['seed'], args.output))
 
 
 if __name__ == "__main__":

@@ -210,3 +210,52 @@ def smooth_path(atoms, path, scaling=1.7, threshold=3, friction=1e-2, sweep=None
         logger.warning("%d atom pairs in contact are still not coordinates after %d smoothing rounds.",
                        len(extras), max_rounds)
     return smoother
+
+
+def _run_seed(task):
+    """Bisection and smoothing for one seed (top level, so it can run in a worker process)."""
+    seed, atoms, geoms, nimages, options = task
+    np.random.seed(seed)
+    options = dict(options)
+    tol = options.get('tol', 2e-3)
+    raw = redistribute(atoms, geoms, nimages, tol=tol * 5, cell=options.get('cell'), pbc=options.get('pbc'),
+                       fixed=options.get('fixed'))
+    smoother = smooth_path(atoms, raw, **options)
+    return seed, raw, smoother.path
+
+
+def interpolate_seeds(atoms, geoms, nimages, seeds, jobs=1, thresholds=None, **options):
+    """Interpolate with several random seeds and rank the paths by the checks of `analysis`.
+
+    The bisection uses random nudges, which for large-amplitude motions can decide between a valid path
+    and one with torn bonds, close contacts or bonds passing through each other.  Each seed is run
+    independently and its path analysed (`analysis.analyze_path`).
+
+    Args:
+        seeds:      Random seeds to run.
+        jobs:       Number of worker processes.  Results for a seed can depend on the number of BLAS
+                    threads, so set e.g. OMP_NUM_THREADS consistently.
+        thresholds: Limits of the checks, see `analysis.THRESHOLDS`.
+        options:    Passed to `smooth_path` (scaling, threshold, friction, sweep, tol, max_iter, micro_iter,
+                    max_rounds, cell, pbc, fixed).
+
+    Returns:
+        List of dicts with keys seed, raw, path, quality (`analyze_path` result) and failed (names of
+        failed checks), best first: paths passing all checks ordered by Cartesian length, then the others
+        ordered by the number of failed checks and length.
+    """
+    from .analysis import analyze_path, violations
+
+    tasks = [(seed, atoms, geoms, nimages, options) for seed in seeds]
+    if jobs > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(_run_seed, tasks))
+    else:
+        results = [_run_seed(task) for task in tasks]
+    runs = []
+    for seed, raw, path in results:
+        quality = analyze_path(path, atoms, options.get('cell'), options.get('pbc'))
+        runs.append(dict(seed=seed, raw=raw, path=path, quality=quality, failed=violations(quality, thresholds)))
+    runs.sort(key=lambda run: (len(run['failed']), run['quality']['length']))
+    return runs

@@ -22,10 +22,13 @@ Directory Structure
   - `coord_utils.py`   Coordinate utilities.  A simplified version of Nanoreactor coordinates module which provide a scaled
    interatomic distance coordinate, pair screening based on threshold and connectivity, as well as trans-rotational
    alignment based on Kabsch algorithm.
+  - `analysis.py`      Quality checks of interpolated paths (torn bonds, close contacts, bonds crossing)
   - `fileio.py`        XYZ file reading and writing, and reading/writing periodic structures through ASE
   - `pbc.py`           Periodic boundary condition utilities: cell handling, minimum image convention, path unwrapping
    and periodic neighbor search
   - `ase_interface.py` Interpolation of lists of `ase.Atoms`
+- examples             `make_gifs.py`: example interpolations (periodic and molecular) rendered as GIFs with AtomsPlotter
+- tests                Unit tests (`python -m pytest tests`), including periodic systems, fixed atoms and the path checks
 - setup.py             Installation script.  This will install both the Python package, which can be imported by name `geodesic_interpolate`
    and the standalone script, which is also named `geodesic_interpolate`
 - test_cases           A few test cases used to check the performance of the code.  Note that the large ones may take a few minutes
@@ -59,7 +62,7 @@ Numpy  :  Tested with 1.13
 
 Scipy  :  Tested with 0.19
 
-ASE    :  >=3.22 (file I/O, periodic systems, constraints, covalent radii)
+ASE    :  >=3.22 (file I/O, periodic systems, constraints, covalent and van der Waals radii)
 
 
 Installation
@@ -81,7 +84,10 @@ To use the script from an arbitrary location or import the Python module, instal
 
     python -m pip install .
 
-This will install a Python package `geodesic_interpolate` and a standalone script `geodesic_interpolate`.
+This will install a Python package `geodesic_interpolate` and two standalone scripts: `geodesic_interpolate` and
+`geodesic_analyze` (checks existing paths, see below).  Use `python -m pip install -e .` for an editable install;
+after updating an existing installation, reinstall so that new scripts are created.  Without installation, the path
+checks are run with `python -m geodesic_interpolate.analysis band.traj`.
 The package can be invoked from an arbitrary location using the aforementioned command line after installation,
 and a standalone script with the same signature can also be used
 
@@ -117,6 +123,8 @@ How it works:
     translated as a whole by the lattice vector that minimizes its displacement.  Atoms without such bonds
     follow the minimum image convention (MIC).  Fragments may therefore move by more than half a lattice
     vector (e.g. a chain end passing through the cell boundary), while isolated atoms must move less.
+  - The output path is unwrapped so that atoms move continuously; use `wrap=True` (`--wrap`) to wrap atoms
+    back into the cell.  `use_pbc=False` (`--no-pbc`) ignores the cell.
   - Each internal coordinate is the distance between atom `i` and a fixed periodic image `j + n` of atom
     `j`, stored as `(i, j, n1, n2, n3)`.  The lattice translations `n` are found by a periodic neighbor search
     and kept fixed during the optimization, so coordinates stay smooth when atoms cross the cell boundary.
@@ -138,8 +146,6 @@ Covalent radii, used for the reference distances of the scaled coordinates, are 
 `examples/make_gifs.py` runs a few example interpolations (vacancy hop in Al, H on Cu(111) with fixed bottom
 layers, and two of the molecular test cases) and renders them as GIFs with
 [AtomsPlotter](https://doi.org/10.5281/zenodo.23316072).
-  - The output path is unwrapped so that atoms move continuously; use `wrap=True` (`--wrap`) to wrap atoms
-    back into the cell.  `use_pbc=False` (`--no-pbc`) ignores the cell.
 
 Smoothing and reproducibility:
   - After smoothing, all images are checked for atom pairs closer than `--dist-cutoff` that are not part of the
@@ -148,6 +154,31 @@ Smoothing and reproducibility:
   - The bisection uses random nudges.  `--seed` (`seed=`) makes runs reproducible; results also depend on the
     number of BLAS threads (`OMP_NUM_THREADS`).
   - `--scaling` now sets the Morse alpha; previously it was ignored and 1.7 was always used.
+
+Checking paths and running several seeds:
+  - For large-amplitude motions (e.g. a ring opening where a chain end swings over the molecule) the random nudges
+    of the bisection can decide between a valid path and one with torn bonds or parts of a molecule passing through
+    each other.  `geodesic_interpolate ... --seeds 0 1 2 3 --jobs 4` runs every seed, checks each path, prints a
+    report and keeps the shortest path passing all checks (`--keep-all` also writes `<output>_seed<SEED>.<ext>`).
+    If no seed passes, the best one is written anyway and the command exits with status 2.  In Python:
+
+        band, report = interpolate(images, nimages=33, seeds=[0, 1, 2, 3], jobs=4,
+                                   thresholds=dict(contact=0.4), return_report=True)
+
+    `report` lists every seed (best first) with its `quality` (the metrics below) and `failed` checks.  If no seed
+    passes, a warning is logged and the best path is returned.  `thresholds` overrides individual limits.
+  - The checks (`geodesic_interpolate.analysis`, also `geodesic_analyze band.traj ...` or `--analyze` for a single
+    run) are:
+      - `stretch`: largest ratio of a bond present in both end points to its end-point length, on the unwrapped
+        positions (a periodic-image error shows up as a bond across the box).  Fails above 1.3.
+      - `contact`: smallest ratio of the distance between atoms more than three bonds apart to the smaller of the
+        sum of their van der Waals radii (Alvarez) and their distance in the end points.  Fails below 0.5.
+      - `crossing`: smallest distance between points along two bonds of a molecule that share no atom, on sub-steps
+        between images.  Atom-atom distances can stay normal while two bonds pass through each other, so this is
+        checked separately.  Fails below 0.8 A.
+  - The limits are adjustable (`geodesic_analyze --stretch --contact --crossing`, `thresholds=` in Python).  The
+    van der Waals radii of metals are large, so a close but harmless approach of an adsorbate atom to a surface
+    can score as low as about 0.6 on `contact`.
   - Bonds are described by saturating Morse-scaled distances, so a strongly curved path can still stretch a bond
     that exists in both end points.  Check bond lengths along large-amplitude paths.
 
@@ -160,6 +191,7 @@ usage: geodesic_interpolate [-h] [--nimages NIMAGES] [--sweep] [--no-sweep]
                             [--friction FRICTION] [--dist-cutoff DIST_CUTOFF]
                             [--logging {DEBUG,INFO,WARNING,ERROR}]
                             [--save-raw SAVE_RAW] [--vasp [DIR]] [--max-rounds MAX_ROUNDS] [--seed SEED]
+                            [--seeds SEED [SEED ...]] [--jobs JOBS] [--keep-all] [--analyze]
                             [--fix INDEX [INDEX ...]] [--no-pbc] [--wrap]
                             filename [filename ...]
 
@@ -190,6 +222,10 @@ optional arguments:
   * `--max-rounds MAX_ROUNDS`  Maximum number of smoothing rounds; atom pairs that came into contact without being
    coordinates are added after each round. 1 smooths only once. (default: 5)
   * `--seed SEED`       Random seed for reproducible results. Results also depend on the number of BLAS threads.
+  * `--seeds SEED ...`  Run several seeds, check each path, print a report and keep the shortest valid one.
+  * `--jobs JOBS`       Number of parallel processes for `--seeds`. (default: 1)
+  * `--keep-all`        With `--seeds`, also write the path of every seed.
+  * `--analyze`         Check the final path and print the report.
   * `--no-pbc`          Ignore the cell of periodic input files and treat the system as a molecule.
   * `--wrap`            Wrap atoms back into the cell in the output.  By default periodic paths are written unwrapped
    so that atoms move continuously.

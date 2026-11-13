@@ -206,6 +206,70 @@ class RecontactTest(unittest.TestCase):
         self.assertEqual(set(contacts) - set(smoother.rij_list), set())
 
 
+class AnalysisTest(unittest.TestCase):
+    def test_torn_bond_is_detected(self):
+        from geodesic_interpolate.analysis import analyze_path, violations
+
+        chain = np.array([[0, 0, 0], [1.5, 0, 0], [3.0, 0, 0]], dtype=float)
+        torn = chain.copy()
+        torn[2, 0] = 6.0
+        result = analyze_path([chain, torn, chain + [0, 0.1, 0]], ["C", "C", "C"])
+        self.assertAlmostEqual(result['stretch'], 3.0, places=2)
+        self.assertEqual(result['stretch_bond'], (1, 2))
+        self.assertIn('torn bond', violations(result))
+
+    def test_bonds_passing_through_each_other_are_detected(self):
+        from geodesic_interpolate.analysis import analyze_path, violations
+
+        # Bond A along x at z = 0; bond B along y moves from z = +1.5 to z = -1.5 straight through A.
+        # At both images all atoms are > 1.5 A apart: only the sub-steps between them see the crossing.
+        a = [[-0.7, 0, 0], [0.7, 0, 0]]
+        start = np.array(a + [[0, -0.7, 1.5], [0, 0.7, 1.5]])
+        end = np.array(a + [[0, -0.7, -1.5], [0, 0.7, -1.5]])
+        result = analyze_path([start, end], ["C"] * 4)
+        self.assertLess(result['crossing'], 0.3)
+        self.assertIn('bond crossing', violations(result))
+        # The same motion beside bond A does not cross it
+        aside = np.array([[0, 0, 0], [0, 0, 0], [0, 3, 0], [0, 3, 0]])
+        beside = analyze_path([start + aside, end + aside], ["C"] * 4)
+        self.assertNotIn('bond crossing', violations(beside))
+
+    def test_clean_molecular_path_passes(self):
+        from geodesic_interpolate.analysis import analyze_path, violations
+
+        atoms, coords = read_xyz("test_cases/DielsAlder_interpolated.xyz")
+        self.assertEqual(violations(analyze_path(coords, atoms)), [])
+
+    def test_interpolate_several_seeds(self):
+        from geodesic_interpolate import interpolate
+
+        initial, final = _hollow_hop()
+        band, report = interpolate([initial, final], nimages=4, seeds=[0, 1, 2], return_report=True)
+        self.assertEqual(len(band), 4)
+        self.assertEqual(sorted(run['seed'] for run in report), [0, 1, 2])
+        self.assertEqual(report[0]['failed'], [])
+        best = min((run for run in report if not run['failed']), key=lambda run: run['quality']['length'])
+        self.assertEqual(report[0]['seed'], best['seed'])
+
+    def test_cli_seeds_keep_all_and_analyze(self):
+        from geodesic_interpolate.__main__ import main
+
+        initial, final = _hollow_hop()
+        with tempfile.TemporaryDirectory() as tmp:
+            write(os.path.join(tmp, 'ends.traj'), [initial, final])
+            out = os.path.join(tmp, 'band.traj')
+            argv = ['geodesic_interpolate', os.path.join(tmp, 'ends.traj'), '--nimages', '4', '--output', out,
+                    '--seeds', '0', '1', '--keep-all', '--logging', 'WARNING']
+            with mock.patch.object(sys, 'argv', argv):
+                main()
+            for name in ['band.traj', 'band_seed0.traj', 'band_seed1.traj']:
+                self.assertEqual(len(read(os.path.join(tmp, name), index=':')), 4)
+            argv = ['geodesic_interpolate', os.path.join(tmp, 'ends.traj'), '--nimages', '4', '--output', out,
+                    '--seed', '0', '--analyze', '--logging', 'WARNING']
+            with mock.patch.object(sys, 'argv', argv):
+                main()
+
+
 class FixedAtomsTest(unittest.TestCase):
     def test_fixed_mask_formats(self):
         self.assertIsNone(fixed_mask(None, 3))

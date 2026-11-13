@@ -3,6 +3,7 @@ import logging
 
 import numpy as np
 from ase.data import atomic_numbers, covalent_radii
+from ase.data.vdw_alvarez import vdw_radii
 from scipy import sparse
 from scipy.spatial import KDTree
 
@@ -115,6 +116,16 @@ def covalent_radius(symbol):
 def get_radii(atoms):
     """Covalent radii of a list of atom symbols, or None if no symbols are given."""
     return None if atoms is None else np.array([covalent_radius(atom) for atom in atoms])
+
+
+def get_vdw_radii(atoms):
+    """Van der Waals radii from Alvarez, Dalton Trans. 2013, 42, 8617 (via ASE); 2 Angstrom if unknown."""
+    radii = []
+    for atom in atoms:
+        number = atomic_numbers.get(atom.capitalize(), 0)
+        radius = vdw_radii[number] if number else np.nan
+        radii.append(2.0 if np.isnan(radius) else radius)
+    return np.array(radii)
 
 
 def get_bond_list(geom, atoms=None, threshold=4, min_neighbors=4, snapshots=30, bond_threshold=1.8,

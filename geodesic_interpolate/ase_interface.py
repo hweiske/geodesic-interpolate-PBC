@@ -25,7 +25,7 @@ from ase.constraints import FixAtoms, FixCartesian, FixScaled
 from ase.io import write
 
 from .coord_utils import fixed_mask
-from .interpolation import redistribute, smooth_path
+from .interpolation import interpolate_seeds, redistribute, smooth_path
 
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ def write_vasp_neb(images, directory='.'):
 
 def interpolate(images, nimages=17, sweep=None, tol=2e-3, maxiter=15, microiter=20, scaling=1.7,
                 friction=1e-2, dist_cutoff=3, use_pbc=True, wrap=False, return_raw=False, fixed=None,
-                max_rounds=5, seed=None):
+                max_rounds=5, seed=None, seeds=None, jobs=1, thresholds=None, return_report=False):
     """Geodesic interpolation between ASE Atoms objects.
 
     Args:
@@ -212,6 +212,12 @@ def interpolate(images, nimages=17, sweep=None, tol=2e-3, maxiter=15, microiter=
                     contact without being coordinates are added and the path is smoothed again.
         seed:       Seed for NumPy's global random generator (used for the random nudges of the
                     bisection).  Results also depend on the number of BLAS threads.
+        seeds:      Run several seeds instead and return the best path: the shortest one passing the
+                    checks of `analysis` (torn bonds, close contacts, bonds passing through each other),
+                    see `interpolation.interpolate_seeds`.  A warning is logged if none passes.
+        jobs:       Number of worker processes for `seeds`.
+        thresholds: Limits of the checks, see `analysis.THRESHOLDS`.
+        return_report: Also return the list of runs (seed, quality, failed checks) for `seeds`.
 
     Returns:
         List of `ase.Atoms` with new positions, and the raw path as a second list if `return_raw` is
@@ -226,11 +232,23 @@ def interpolate(images, nimages=17, sweep=None, tol=2e-3, maxiter=15, microiter=
     extra = fixed_mask(fixed, len(symbols))
     if extra is not None:
         mask |= extra
-    raw = redistribute(symbols, coords, nimages, tol=tol * 5, cell=cell, pbc=pbc, fixed=mask)
-    smoother = smooth_path(symbols, raw, scaling, threshold=dist_cutoff, friction=friction, sweep=sweep, tol=tol,
-                           max_iter=maxiter, micro_iter=microiter, max_rounds=max_rounds, cell=cell, pbc=pbc,
-                           fixed=mask)
-    path = path_to_atoms(images, smoother.path, mask, wrap)
+    if seeds is not None:
+        runs = interpolate_seeds(symbols, coords, nimages, seeds, jobs=jobs, thresholds=thresholds,
+                                 scaling=scaling, threshold=dist_cutoff, friction=friction, sweep=sweep, tol=tol,
+                                 max_iter=maxiter, micro_iter=microiter, max_rounds=max_rounds, cell=cell, pbc=pbc,
+                                 fixed=mask)
+        if runs[0]['failed']:
+            logger.warning("None of the seeds %s gave a path passing all checks; returning seed %d (%s).",
+                           list(seeds), runs[0]['seed'], ', '.join(runs[0]['failed']))
+        raw, final = runs[0]['raw'], runs[0]['path']
+    else:
+        raw = redistribute(symbols, coords, nimages, tol=tol * 5, cell=cell, pbc=pbc, fixed=mask)
+        final = smooth_path(symbols, raw, scaling, threshold=dist_cutoff, friction=friction, sweep=sweep, tol=tol,
+                            max_iter=maxiter, micro_iter=microiter, max_rounds=max_rounds, cell=cell, pbc=pbc,
+                            fixed=mask).path
+    result = [path_to_atoms(images, final, mask, wrap)]
     if return_raw:
-        return path, path_to_atoms(images, raw, mask, wrap)
-    return path
+        result.append(path_to_atoms(images, raw, mask, wrap))
+    if return_report and seeds is not None:
+        result.append([dict(seed=run['seed'], quality=run['quality'], failed=run['failed']) for run in runs])
+    return result[0] if len(result) == 1 else tuple(result)

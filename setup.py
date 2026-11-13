@@ -29,6 +29,7 @@ setup(
     entry_points = {
         'console_scripts': [
             'geodesic_interpolate=geodesic_interpolate.__main__:main',
+            'geodesic_analyze=geodesic_interpolate.analysis:main',
         ],
     },
     classifiers=[
